@@ -2527,6 +2527,26 @@ def update_log(c, analyses, top):
     return log_, tops
 
 
+def export_picks(tops, path):
+    """Every top bet in the same shape the other boards embed in their Track record scatter
+    (read by run_all.py for the landing page)."""
+    out = []
+    for k, v in sorted(tops.items(), key=lambda kv: kv[1]["date"]):
+        if v.get("book") is None:
+            continue
+        d = am_dec(v["book"])
+        p = v["p"]
+        r = v.get("result")
+        pl = (d - 1) if r == "W" else (-1.0 if r == "L" else 0.0)
+        tag = v.get("tag", "Value")
+        out.append({"x": round((p * (d - 1) - (1 - p)) * 100, 2), "y": round(p, 4), "a": v["book"], "c": v["group"],
+                    "t": "hp" if tag.startswith("High") else "va", "tn": "High probability" if tag.startswith("High") else "Value",
+                    "gr": v.get("letter", "-"), "u": v.get("units", 0), "r": r if r in ("W", "L", "P") else "U",
+                    "pl": round(pl, 3), "l": v["label"], "g": v["game"], "d": v["date"]})
+    jdump(out, path)
+    return out
+
+
 def summarize_log(log_, tops):
     def agg(items, priced_only=False):
         n = w = l = p = 0
@@ -3550,6 +3570,7 @@ def main(argv=None):
     watch = watch_list(c, analyses)
     pchecks = price_check_props(c, analyses)
     log_, tops = update_log(c, analyses, top)
+    export_picks(tops, os.path.join(DIRS["root"], "picks.json"))
     summ = summarize_log(log_, tops)
     n_priced = sum(1 for ga in analyses if ga["sp_line"] is not None)
     log(f"  Sportsbook lines found for {n_priced} of {len(analyses)} games; {len(top)} top bets")
