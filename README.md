@@ -12,6 +12,11 @@ pip install requests numpy pyarrow
 
 Python 3.9 or newer. Git is needed for publishing (same sign-in as your NBA and NHL boards).
 
+Put a copy of `edge_common.py` (the same helper your NBA, NHL and NFL boards use) in the
+same folder as `cbb_edge.py`. It adds letter grades, trend picks, suggested units and the
+Track record scatter. College trend settings are set inside `cbb_edge.py`, so the helper
+file stays identical in every folder.
+
 ## Run
 
 ```
@@ -44,7 +49,9 @@ Options:
 
 ## What's on the dashboard
 
-- **Top bets**: the best bets of the week across spreads, moneylines and totals (and
+- **Top bets**: graded A-D with suggested units, then trend picks (situational factors
+  like record, margin, form, home/road and streaks, each with its record in past games;
+  they start once teams have played 4 games). The best bets of the week across spreads, moneylines and totals (and
   props when the feed has prices), grouped by day, each with a price bar showing where
   it's a deal, thin or a pass, with the book's price marked. Below that: model lines for
   games without a line yet (and the number to bet each side at), props to price-check,

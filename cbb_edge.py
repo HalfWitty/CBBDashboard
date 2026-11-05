@@ -38,6 +38,14 @@ import numpy as np
 import requests
 
 try:
+    import edge_common as ec
+except ImportError:
+    sys.exit("edge_common.py is missing. Put it in the same folder as cbb_edge.py (the same file your NBA, NHL and NFL boards use).")
+# College trend settings, registered here so the shared edge_common.py stays the same in every folder.
+ec.TREND_SPORTS.setdefault("CBB", dict(min_games=4, form_n=8, diff_gap=6.0, pct_gap=0.15, form_gap=0.30, split_gap=0.25,
+                                       otl_points=False, b2b=False, rest_gap=None, unit="pts", streak=4))
+
+try:
     import pyarrow.parquet as pq
 except ImportError:  # handled at runtime with a clear message
     pq = None
@@ -2434,6 +2442,184 @@ def price_check_props(c, analyses, limit=12):
 
 
 # --------------------------------------------------------------------------
+# Grades, trend picks and units (shared edge_common.py)
+# --------------------------------------------------------------------------
+SIDE_T = ("ml", "sp", "1h_sp")
+
+
+def side_of(m):
+    gr = m.get("grade") or {}
+    if gr.get("t") in SIDE_T and gr.get("side") in ("H", "A"):
+        return gr["side"]
+    if gr.get("t") == "tt" and gr.get("ou") == "O":
+        return gr.get("side")
+    return None
+
+
+def p_win(m):
+    """Win probability with pushes removed (and the cautious version)."""
+    den = max(1e-9, m["p"] + m["pl"])
+    pc, plc = max(0.001, m["p"] - m["buf"]), min(0.999, m["pl"] + m["buf"])
+    return m["p"] / den, pc / max(1e-9, pc + plc)
+
+
+def build_trendbook(c, slate):
+    names = {t: x["abbr"] for t, x in c.team_stats.items()}
+    games = []
+    for gid, g in c.db.games.items():
+        # regular season, Division I vs Division I only (wins over non-D1 teams say little)
+        if g.get("stype") != 2 or g["home"] not in c.db.conf or g["away"] not in c.db.conf:
+            continue
+        ln = c.db.lines.get(gid) or {}
+        games.append(dict(gid=gid, date=g["date"], season=g["season"], home=g["home"], away=g["away"], done=True,
+                          hs=g["hs"], ot=g.get("periods", 2) > 2, spread=ln.get("sp"), **{"as": g["as"]}))
+    have = {x["gid"] for x in games}
+    for g in slate:
+        if g["gid"] in have or g["state"] != "pre" or g["home"] not in c.db.conf or g["away"] not in c.db.conf:
+            continue
+        games.append(dict(gid=g["gid"], date=g["date"], season=c.cur, home=g["home"], away=g["away"], done=False))
+    return ec.TrendBook("CBB", games, stats_before=c.today.isoformat(), names=names)
+
+
+def depth_of(c, g):
+    T = c.team_stats
+    if g["home"] not in T or g["away"] not in T:
+        return 0.0
+    return min(1.0, min(T[g["home"]]["g"], T[g["away"]]["g"]) / 10)
+
+
+def all_markets(ga):
+    ms = list(ga["markets"])
+    for pr in ga["props"]:
+        for st in pr["stats"].values():
+            for k in ("mk_over", "mk_under"):
+                if st.get(k):
+                    ms.append(st[k])
+    return ms
+
+
+def decorate_game(c, ga, tb, trust):
+    g = ga["g"]
+    dep = depth_of(c, g)
+    for m in all_markets(ga):
+        side = side_of(m)
+        sup = tb.support(g["gid"], side) if side else 0.0
+        pw, lo = p_win(m)
+        d = dict(p=pw, lo=lo, book=m["book"], mkt=m["mkt_p"], ev=m["ev"], cat=m["group"])
+        ec.decorate(d, trust, sup, dep, side_bet=side is not None)
+        d["support"] = sup if side else None
+        m["ec"] = d
+
+
+def cbb_trend_picks(c, analyses, tb, trust):
+    out = []
+    by_day = {}
+    for ga in analyses:
+        if ga["g"]["state"] == "pre" and ddate(ga["g"]["date"]) <= c.today + dt.timedelta(days=1):
+            by_day.setdefault(ga["g"]["date"], []).append(ga)
+    for d in sorted(by_day):
+        gas = {ga["g"]["gid"]: ga for ga in by_day[d]}
+        n = 0
+        for tg, side, s in ec.trend_candidates(tb, [dict(gid=k) for k in gas]):
+            if n >= ec.SETTINGS["trend_max_per_day"]:
+                break
+            ga = gas[tg["gid"]]
+            g = ga["g"]
+            exprs = []
+            for m in ga["markets"]:
+                if side_of(m) == side and (m["grade"]["t"] in SIDE_T or m["grade"]["t"] == "tt"):
+                    pw, lo = p_win(m)
+                    exprs.append(dict(label=m["label"], cat=m["group"], p=pw, lo=lo, book=m["book"], mkt=m["mkt_p"],
+                                      ev=m["ev"], m=m))
+            if not exprs:
+                continue
+            play, others = ec.best_expression(exprs)
+            team = g["habbr"] if side == "H" else g["aabbr"]
+            ml = next((m for m in ga["markets"] if m["key"] == f"ml_{side}"), None)
+            agree, note = None, ""
+            if ml:
+                mp = ml.get("model_p")
+                if ml.get("mkt_p") is not None and mp is not None:
+                    agree = mp > ml["mkt_p"]
+                    note = (f"Model alone: {team} {mp * 100:.0f}% to win vs the market's {ml['mkt_p'] * 100:.0f}% "
+                            f"({'the model likes the price' if agree else 'the model thinks the price is too high'}).")
+                elif mp is not None:
+                    note = f"Model alone: {team} {mp * 100:.0f}% to win."
+            it = dict(tier="trend", ga=ga, team=team, side=s, stats=tb.stats, play=play, others=others, agree=agree,
+                      model_note=note, game=f"{g['aabbr']} @ {g['habbr']}",
+                      time=f"{day_label(g['date'], c.today)} {fmt_time(g['utc'])}", label=play["label"], cat=play["cat"],
+                      p=play["p"], lo=play["lo"], book=play["book"], mkt=play["mkt"], ev=play["ev"], m=play["m"])
+            ec.decorate(it, trust, s["support"], depth_of(c, g), side_bet=True)
+            out.append(it)
+            n += 1
+    return out
+
+
+def hist_row(x, tier, ts):
+    g, m = x["ga"]["g"], x["m"]
+    e = x.get("ec") or x
+    return ec.make_row("CBB", dict(
+        id=f"{g['gid']}|{tier}|{m['key']}", date=g["date"], game_id=g["gid"], game=f"{g['aabbr']} @ {g['habbr']}",
+        label=m["label"], cat=m["group"], tier=tier, p=e["p"], lo=e.get("lo"), mkt=m.get("mkt_p"), book=m["book"],
+        ev=m.get("ev"), grade=e.get("grade"), score=e.get("score"), units=e.get("units"), trust=e.get("trust"),
+        trend=e.get("trend"), key=m["grade"]), ts)
+
+
+def settle_fn(c):
+    prow = {(r["gid"], r["pid"]): r for r in c.db.pbox if r["season"] == c.cur}
+
+    def fn(row):
+        gm = c.db.games.get(str(row.get("game_id")))
+        if not gm or not row.get("key"):
+            return None
+        val = _grade_value(row["key"], gm, prow)
+        if val is None:
+            return "V" if row["key"].get("t") == "prop" else None
+        return "W" if val > 0 else ("L" if val < 0 else "P")
+    return fn
+
+
+def migrate_tops(hist, tops):
+    rows = []
+    for k, v in tops.items():
+        tag = (v.get("tag") or "").lower()
+        tier = "hp" if tag.startswith("high") else "va"
+        r = ec.make_row("CBB", dict(id=f"{v.get('gid') or k.split('|')[0]}|{tier}|{k.split('|')[-1]}", date=v.get("date"),
+                                    game_id=v.get("gid") or k.split("|")[0], game=v.get("game"), label=v.get("label"),
+                                    cat=v.get("group"), tier=tier, p=v.get("p"), book=v.get("book"),
+                                    ev=(v["p"] * ec.am_dec(v["book"]) - 1) if ec.am_dec(v.get("book")) else None,
+                                    grade="-", units=0, key=v.get("grade")), v.get("ts", ""))
+        r["result"] = v.get("result") if v.get("result") in ("W", "L", "P") else None
+        rows.append(r)
+    hist.add_if_missing(rows)
+    return len(rows)
+
+
+def trust_rows(hist_rows, log_):
+    rows = ec.trust_rows_from_history(hist_rows)
+    for v in log_.values():
+        if v.get("result") not in ("W", "L") or v.get("book") is None:
+            continue
+        den = max(1e-9, v["p"] + v.get("pl", 1 - v["p"]))
+        rows.append({"cat": v.get("group"), "p": v["p"] / den, "q": ec.market_q(v["book"]), "y": 1 if v["result"] == "W" else 0})
+    return rows
+
+
+def ec_track_html(c):
+    e = c.ec
+    return ('<h3>Where picks land</h3><p class="note">Every priced pick by its edge at the price (across) and the price (up). '
+            'Green won, red lost, blue rings are this week\'s picks. Shaded zones show where at least 5 graded picks made '
+            '(green) or lost (red) money for the filters you pick. Hover or tap a dot for the details.</p>'
+            + ec.scatter_html(e["points"], c.today.isoformat(), sport="CBB") +
+            '<h3>Picks by type and grade</h3><p class="note">Every top bet and trend pick shown on the board, graded once '
+            'its game finished. "1u each" is flat betting at the listed price; "Suggested units" stakes what the board '
+            'suggested.</p>' + ec.perf_html(e["hist"]) +
+            '<h3>Trust by bet type</h3><p class="note">How much of the model\'s claimed edge over the market has shown up '
+            'in results. It starts at 70% and moves only as far as the results can support; units and grades use it.</p>'
+            + ec.trust_html(e["trust"]))
+
+
+# --------------------------------------------------------------------------
 # Track record: log pre-game probabilities, grade them once games finish
 # --------------------------------------------------------------------------
 def _grade_value(gr, gm, prow):
@@ -2525,26 +2711,6 @@ def update_log(c, analyses, top):
     jdump(log_, path)
     jdump(tops, tpath)
     return log_, tops
-
-
-def export_picks(tops, path):
-    """Every top bet in the same shape the other boards embed in their Track record scatter
-    (read by run_all.py for the landing page)."""
-    out = []
-    for k, v in sorted(tops.items(), key=lambda kv: kv[1]["date"]):
-        if v.get("book") is None:
-            continue
-        d = am_dec(v["book"])
-        p = v["p"]
-        r = v.get("result")
-        pl = (d - 1) if r == "W" else (-1.0 if r == "L" else 0.0)
-        tag = v.get("tag", "Value")
-        out.append({"x": round((p * (d - 1) - (1 - p)) * 100, 2), "y": round(p, 4), "a": v["book"], "c": v["group"],
-                    "t": "hp" if tag.startswith("High") else "va", "tn": "High probability" if tag.startswith("High") else "Value",
-                    "gr": v.get("letter", "-"), "u": v.get("units", 0), "r": r if r in ("W", "L", "P") else "U",
-                    "pl": round(pl, 3), "l": v["label"], "g": v["game"], "d": v["date"]})
-    jdump(out, path)
-    return out
 
 
 def summarize_log(log_, tops):
@@ -2969,8 +3135,9 @@ def render_top(c, top, gaps, watch, pchecks, summ, analyses):
     parts = ['<h2>Top bets</h2>',
              '<p class="lede">The best spots across every Division I game with a posted price, alternating between bets '
              'the model gives a high chance to win and bets with the biggest edge. Books post most college lines the day '
-             'before, so later days fill in as the week goes. On each price bar, green is a deal, amber is thin and red '
-             'is a pass; the black mark is the book\'s current price.</p>', rec]
+             'before, so later days fill in as the week goes. Each pick has a grade (tap it for the reasons) and '
+             'suggested units at the listed price; each day is sorted best grade first. On each price bar, green is a '
+             'deal, amber is thin and red is a pass; the black mark is the book\'s current price.</p>', rec]
     if top:
         by_day = {}
         for x in top:
@@ -2990,6 +3157,7 @@ def render_top(c, top, gaps, watch, pchecks, summ, analyses):
                     f'<div class="bet-sub">{esc(team_label(c, g["away"]))} at {esc(team_label(c, g["home"]))}'
                     f'{" (neutral)" if g["neutral"] else ""}, {esc(fmt_time(g["utc"]))}'
                     f'{(" on " + esc(g["tv"])) if g.get("tv") else ""}</div>'
+                    + (f'<div style="margin:2px 0 6px">{ec.badges_html(x["ec"], x["ec"].get("support"))}</div>' if x.get("ec") else "") +
                     f'{price_bar(m)}'
                     f'<div class="facts"><div><span>Win chance</span> <b>{pct(m["p"])}</b></div>'
                     f'<div><span>Market</span> <b>{pct(m["mkt_p"])}</b></div>'
@@ -3007,6 +3175,14 @@ def render_top(c, top, gaps, watch, pchecks, summ, analyses):
                "below and the model lines on each game.") if not n_priced else \
               "No bet clears the bar at current prices. That happens: passing is a position."
         parts.append(f'<div class="panel empty">{msg}</div>')
+    trends = getattr(c, "trends", [])
+    parts.append('<h3>Trend picks</h3>' + ec.trend_intro_html("CBB"))
+    if trends:
+        for d in sorted({t["ga"]["g"]["date"] for t in trends}):
+            parts.append(f'<h4>{esc(day_label(d, c.today))}</h4>')
+            parts.append(ec.trend_picks_html("CBB", [t for t in trends if t["ga"]["g"]["date"] == d]))
+    else:
+        parts.append(ec.trend_picks_html("CBB", []))
     if watch:
         parts.append(f'<details class="watch"><summary><h3 style="display:inline-block">Lines to watch</h3> '
                      f'<span class="dim">{len(watch)} Division I games without a line yet</span></summary><p class="note">When the '
@@ -3384,6 +3560,8 @@ def render_track(c, summ):
                  f'<tbody>{rows or "<tr><td class=l colspan=6>Nothing graded yet.</td></tr>"}</tbody></table></div>')
     parts.append('<p class="note">Hit rate here counts every game\'s favoured side, edge or not, so expect it to sit a little '
                  'above 50% for spreads and totals. The top bets record is the one that matters for betting.</p>')
+    if getattr(c, "ec", None):
+        parts.append(ec_track_html(c))
     return "".join(parts)
 
 
@@ -3430,7 +3608,8 @@ worse than Fair is a pass.</p>
 list alternates between the two, takes at most {C['max_per_game']} per game and never both sides of one market, and
 skips sides where the model alone is {C['max_gap_pts']:g}+ points off the spread or totals {C['max_gap_pts_total']:g}+ off.</p>
 <p><b>Limits.</b> Suspensions, illnesses and players sitting aren't known until they miss a game. Lines move a lot on
-small college games; get the best number you can. I'm not a financial advisor; bet only what you can afford to lose.</p></div>"""
+small college games; get the best number you can. I'm not a financial advisor; bet only what you can afford to lose.</p>
+{ec.method_html()}</div>"""
 
 
 def render_page(c, analyses, top, gaps, watch, pchecks, summ, days, alerts, run_info):
@@ -3446,7 +3625,7 @@ def render_page(c, analyses, top, gaps, watch, pchecks, summ, days, alerts, run_
 <title>CBB Edge</title><meta name="description" content="College basketball betting board: top bets, every game by day, props and rankings">
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Barlow:wght@400;500;600&display=swap" rel="stylesheet">
-<style>{CSS}</style></head><body>
+<style>{CSS}{ec.CSS}</style></head><body>
 <header class="top"><div class="wrap"><div class="brand"><h1>CBB Edge</h1>
 <span class="meta">Week of {esc(wk)}</span><span class="meta">Updated {esc(run_info['updated'])}</span>
 <button class="themebtn" id="themebtn" type="button">Light / dark</button></div>
@@ -3464,7 +3643,7 @@ def render_page(c, analyses, top, gaps, watch, pchecks, summ, days, alerts, run_
 <section class="tab" id="stand">{render_standings(c)}</section>
 <section class="tab" id="track">{render_track(c, summ)}</section>
 <section class="tab" id="how">{render_how(c)}</section>
-</main>{props_data}{data}<script>{JS}</script></body></html>"""
+</main>{props_data}{data}<script>{JS}{ec.JS}</script></body></html>"""
 
 
 # --------------------------------------------------------------------------
@@ -3566,14 +3745,41 @@ def main(argv=None):
         log(f"  Player prop prices found: {len(props_book)}")
     log("  Modelling games ...")
     analyses = [analyze_game(c, g, props_book) for g in slate]
+    # grades, trend picks and units (shared edge_common.py)
+    hist = ec.History(os.path.join(DIRS["root"], "pick_history.json"))
+    log0 = jload(os.path.join(DIRS["root"], "predictions.json"), {}) or {}
+    if not hist.rows:
+        n_mig = migrate_tops(hist, jload(os.path.join(DIRS["root"], "top_bets.json"), {}) or {})
+        if n_mig:
+            log(f"  Carried {n_mig} earlier top bets into the pick history")
+    hist.settle(settle_fn(c))
+    trust = ec.Trust(trust_rows(hist.all(), log0))
+    tb = build_trendbook(c, slate)
+    log(f"  Trust in the model's edge (all bet types): {trust.overall * 100:.0f}% from {trust.n} graded bets")
+    for ga in analyses:
+        decorate_game(c, ga, tb, trust)
     top, gaps = pick_top_bets(c, analyses)
+    for x in top:
+        x["ec"] = x["m"]["ec"]
+    top.sort(key=lambda x: (x["ga"]["g"]["date"], -x["ec"]["score"]))
+    c.trends = cbb_trend_picks(c, analyses, tb, trust)
     watch = watch_list(c, analyses)
     pchecks = price_check_props(c, analyses)
     log_, tops = update_log(c, analyses, top)
-    export_picks(tops, os.path.join(DIRS["root"], "picks.json"))
     summ = summarize_log(log_, tops)
+    ts = now_et().strftime("%Y-%m-%d %H:%M")
+    pre = [ga["g"]["gid"] for ga in analyses if ga["g"]["state"] == "pre"]
+    new_rows = [hist_row(x, "hp" if x["tag"].lower().startswith("high") else "va", ts) for x in top]
+    new_rows += [hist_row(t, "trend", ts) for t in c.trends]
+    hist.replace_pregame(pre, new_rows)
+    hist.save()
+    hrows = hist.all()
+    graded = [r for r in hrows if r.get("result") and r["result"] != "V"]
+    upcoming = [r for r in hrows if not r.get("result") and r.get("game_id") in set(pre)]
+    c.ec = {"hist": graded, "trust": trust, "points": ec.scatter_points(graded, upcoming)}
+    jdump(c.ec["points"], os.path.join(DIRS["root"], "picks.json"))   # read by run_all.py for the landing page
     n_priced = sum(1 for ga in analyses if ga["sp_line"] is not None)
-    log(f"  Sportsbook lines found for {n_priced} of {len(analyses)} games; {len(top)} top bets")
+    log(f"  Sportsbook lines found for {n_priced} of {len(analyses)} games; {len(top)} top bets, {len(c.trends)} trend picks")
     alerts = []
     if espn_days < args.days and slate:
         alerts.append("ESPN's schedule couldn't be reached for some days, so those games come from the data release "
